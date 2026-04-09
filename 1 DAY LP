@@ -1,0 +1,332 @@
+"""
+Case B: Grid-Scale Battery Arbitrage
+Approach: Day-by-Day LP (24 hours at a time)
+Each day's LP only sees that day's 24 prices — mirrors how real
+day-ahead markets work. SOC carries over between days.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import linprog
+
+# ═══════════════════════════════════════════════════════════════════
+# 1. LOAD DATA
+# ═══════════════════════════════════════════════════════════════════
+df = pd.read_csv('caseB_grid_battery_market_hourly.csv',
+                 parse_dates=['timestamp'])
+
+prices_mwh = df['day_ahead_price_gbp_per_mwh'].values   # shape (1440,) GBP/MWh
+
+# ── Unit Conversion 1: Price GBP/MWh -> GBP/kWh ─────────────────
+# [GBP/MWh] / [1000 kWh/MWh] = [GBP/kWh]  ✓
+lam_all = prices_mwh / 1000.0
+print("=" * 55)
+print("  UNIT CONVERSIONS")
+print("=" * 55)
+print(f"Price:    £{prices_mwh[0]:.2f}/MWh  /  1000  =  £{lam_all[0]:.5f}/kWh  ✓")
+
+# ═══════════════════════════════════════════════════════════════════
+# 2. BATTERY PARAMETERS (raw values in MW/MWh as per brief)
+# ═══════════════════════════════════════════════════════════════════
+# Raw parameters from brief (MW / MWh)
+capacity_mwh = 2.0    # MWh
+p_max_mw     = 1.0    # MW
+eta_ch       = 0.938  # charge efficiency    (dimensionless)
+eta_dis      = 0.938  # discharge efficiency (dimensionless)
+soc_init_pct = 0.50   # 50% of capacity
+delta_t      = 1.0    # hours
+N_DAYS       = 60
+T_DAY        = 24     # hours per day
+
+# ── Unit Conversion 2: Power MW -> kW, Energy MWh -> kWh ─────────
+# [MW] x [1000 kW/MW] = [kW]    ✓
+# [MWh] x [1000 kWh/MWh] = [kWh]  ✓
+capacity = capacity_mwh * 1000   # kWh = 2000 kWh
+p_max    = p_max_mw    * 1000   # kW  = 1000 kW
+soc_init = soc_init_pct * capacity  # kWh = 1000 kWh
+
+print(f"Power:    {p_max_mw:.1f} MW   x  1000  =  {p_max:.0f} kW          ✓")
+print(f"Capacity: {capacity_mwh:.1f} MWh  x  1000  =  {capacity:.0f} kWh        ✓")
+print(f"Init SOC: {soc_init_pct*100:.0f}% of {capacity:.0f} kWh  =  {soc_init:.0f} kWh       ✓")
+
+# ── Unit Conversion 3: Profit dimensional check ───────────────────
+# profit = p_dis [kW] x price [GBP/kWh] x delta_t [h] = [GBP]  ✓
+print(f"Profit:   p_dis [kW] x price [GBP/kWh] x dt [h]  =  [GBP] ✓")
+print("=" * 55)
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. LP SOLVER — one day at a time
+# ═══════════════════════════════════════════════════════════════════
+def solve_day_lp(day_prices_kwh, soc_start):
+    """
+    Solve LP for a single day (T=24 hours).
+
+    Decision variables: x = [p_ch_0..23, p_dis_0..23]  shape (48,)
+
+    Objective (minimise, so negate profit):
+        min  sum_t (p_ch_t - p_dis_t) * lam_t * dt
+
+    SOC dynamics (expanded from t=0):
+        soc[t+1] = soc_start + sum_{k=0}^{t} [eta_ch*p_ch_k - (1/eta_dis)*p_dis_k]*dt
+
+    Constraints:
+        soc[t+1] <= capacity   for all t
+        soc[t+1] >= 0          for all t
+        soc[T]   >= soc_start  (end-of-day SOC >= start SOC, battery not run down)
+        0 <= p_ch_t  <= p_max
+        0 <= p_dis_t <= p_max
+    """
+    T = T_DAY
+
+    # Objective: minimise (p_ch - p_dis) * lam * dt
+    c_obj = np.concatenate([day_prices_kwh * delta_t,
+                            -day_prices_kwh * delta_t])  # shape (2T,)
+
+    # Variable bounds: [0, p_max] for every variable
+    bounds = [(0, p_max)] * (2 * T)
+
+    # Build inequality constraints A_ub @ x <= b_ub
+    A_rows, b_rows = [], []
+
+    for t in range(T):
+        # Cumulative coefficients up to hour t
+        row = np.zeros(2 * T)
+        for k in range(t + 1):
+            row[k]     =  eta_ch      * delta_t   # p_ch contribution
+            row[T + k] = -(1/eta_dis) * delta_t   # p_dis contribution
+
+        # SOC upper bound: soc_start + cumulative <= capacity
+        A_rows.append(row.copy())
+        b_rows.append(capacity - soc_start)
+
+        # SOC lower bound: soc_start + cumulative >= 0
+        # => -(cumulative) <= soc_start
+        A_rows.append(-row.copy())
+        b_rows.append(soc_start)
+
+    # End-of-day SOC >= soc_start  (battery not run down over the day)
+    # => -(sum over all T hours) <= -soc_start + soc_start = 0
+    row_final = np.zeros(2 * T)
+    for k in range(T):
+        row_final[k]     =  eta_ch      * delta_t
+        row_final[T + k] = -(1/eta_dis) * delta_t
+    A_rows.append(-row_final)
+    b_rows.append(0.0)
+
+    A_ub = np.array(A_rows)
+    b_ub = np.array(b_rows)
+
+    result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+
+    if result.status != 0:
+        # If infeasible, return zeros (hold) — shouldn't happen with valid data
+        print(f"  WARNING: LP infeasible, status={result.status}. Holding.")
+        return np.zeros(T), np.zeros(T)
+
+    p_ch  = result.x[:T]
+    p_dis = result.x[T:]
+    return p_ch, p_dis
+
+# ═══════════════════════════════════════════════════════════════════
+# 4. RUN ACROSS ALL 60 DAYS
+# ═══════════════════════════════════════════════════════════════════
+# Storage for full time series
+soc_series    = [soc_init]           # SOC at each hour boundary (1441 values)
+p_ch_series   = np.zeros(N_DAYS * T_DAY)
+p_dis_series  = np.zeros(N_DAYS * T_DAY)
+daily_profit  = np.zeros(N_DAYS)
+daily_cost    = np.zeros(N_DAYS)
+daily_revenue = np.zeros(N_DAYS)
+
+soc_current = soc_init
+
+for day in range(N_DAYS):
+    # Slice this day's prices
+    idx_start = day * T_DAY
+    idx_end   = idx_start + T_DAY
+    day_lam   = lam_all[idx_start:idx_end]   # GBP/kWh, shape (24,)
+
+    # Solve LP for this day
+    p_ch, p_dis = solve_day_lp(day_lam, soc_current)
+
+    # Store decisions
+    p_ch_series[idx_start:idx_end]  = p_ch
+    p_dis_series[idx_start:idx_end] = p_dis
+
+    # Simulate SOC forward hour by hour
+    for t in range(T_DAY):
+        new_soc = (soc_series[-1]
+                   + eta_ch * p_ch[t] * delta_t
+                   - (1/eta_dis) * p_dis[t] * delta_t)
+        soc_series.append(new_soc)
+
+    # Update SOC for next day
+    soc_current = soc_series[-1]
+
+    # Daily financials
+    cost_day    = np.sum(p_ch  * day_lam * delta_t)
+    revenue_day = np.sum(p_dis * day_lam * delta_t)
+    daily_cost[day]    = cost_day
+    daily_revenue[day] = revenue_day
+    daily_profit[day]  = revenue_day - cost_day
+
+soc_series = np.array(soc_series)   # shape (1441,)
+
+# ═══════════════════════════════════════════════════════════════════
+# 5. RESULTS SUMMARY
+# ═══════════════════════════════════════════════════════════════════
+total_cost        = daily_cost.sum()
+total_revenue     = daily_revenue.sum()
+total_profit      = daily_profit.sum()
+energy_charged    = np.sum(p_ch_series  * delta_t) / 1000   # MWh
+energy_discharged = np.sum(p_dis_series * delta_t) / 1000   # MWh
+energy_throughput = (energy_charged + energy_discharged) / 2 # MWh (standard definition)
+
+print("\n" + "="*55)
+print("  CASE B — DAY-BY-DAY LP RESULTS")
+print("="*55)
+print(f"  Total charging cost:      £{total_cost:>10.2f}")
+print(f"  Total discharge revenue:  £{total_revenue:>10.2f}")
+print(f"  NET PROFIT:               £{total_profit:>10.2f}")
+print(f"  Energy charged:           {energy_charged:>10.2f} MWh")
+print(f"  Energy discharged:        {energy_discharged:>10.2f} MWh")
+print(f"  Energy throughput:        {energy_throughput:>10.2f} MWh")
+print(f"  Initial SOC:              {soc_init:>10.1f} kWh ({soc_init/capacity*100:.0f}%)")
+print(f"  Final SOC:                {soc_series[-1]:>10.1f} kWh ({soc_series[-1]/capacity*100:.1f}%)")
+print("="*55)
+
+# ═══════════════════════════════════════════════════════════════════
+# 6. VERIFICATION CHECKS
+# ═══════════════════════════════════════════════════════════════════
+print("\n--- Verification Checks ---")
+
+# 1. Energy balance
+soc_change   = soc_series[-1] - soc_series[0]
+net_energy   = (np.sum(eta_ch * p_ch_series * delta_t)
+              - np.sum((1/eta_dis) * p_dis_series * delta_t))
+balance_err  = abs(soc_change - net_energy)
+print(f"1. Energy balance error:          {balance_err:.2e} kWh  "
+      f"{'PASS' if balance_err < 1e-4 else 'FAIL'}")
+
+# 2. SOC bounds
+soc_min, soc_max = soc_series.min(), soc_series.max()
+bounds_ok = (soc_min >= -1e-4) and (soc_max <= capacity + 1e-4)
+print(f"2. SOC bounds [0, {capacity:.0f}] kWh:    "
+      f"min={soc_min:.2f}, max={soc_max:.2f}  "
+      f"{'PASS' if bounds_ok else 'FAIL'}")
+
+# 3. Power limits
+pow_ok = (p_ch_series.max()  <= p_max + 1e-4 and
+          p_dis_series.max() <= p_max + 1e-4)
+print(f"3. Power limits (<={p_max:.0f} kW):       "
+      f"max_ch={p_ch_series.max():.2f}, max_dis={p_dis_series.max():.2f}  "
+      f"{'PASS' if pow_ok else 'FAIL'}")
+
+# 4. No simultaneous charge and discharge
+simult = np.sum((p_ch_series > 1e-4) & (p_dis_series > 1e-4))
+print(f"4. Simultaneous charge+discharge: {simult} violations  "
+      f"{'PASS' if simult == 0 else 'FAIL'}")
+
+# 5. End-of-day SOC never below start (enforced in LP)
+day_start_socs = [soc_series[d * T_DAY]     for d in range(N_DAYS)]
+day_end_socs   = [soc_series[(d+1) * T_DAY] for d in range(N_DAYS)]
+eod_ok = all(e >= s - 1e-4 for s, e in zip(day_start_socs, day_end_socs))
+print(f"5. End-of-day SOC >= start SOC:   "
+      f"{'PASS' if eod_ok else 'FAIL'}")
+
+print("\nAll checks complete.")
+
+# ═══════════════════════════════════════════════════════════════════
+# 7. PLOTS
+# ═══════════════════════════════════════════════════════════════════
+import matplotlib.pyplot as plt
+
+days   = np.arange(1, N_DAYS + 1)
+hours  = np.arange(len(soc_series))
+COLOR  = '#2196F3'   # blue for strict strategy
+
+# ── Plot 1: SOC time series ──────────────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 4))
+ax.fill_between(hours, 0, soc_series, alpha=0.3, color=COLOR)
+ax.plot(hours, soc_series, color=COLOR, linewidth=0.9)
+ax.axhline(capacity,  color='red',   linestyle='--', linewidth=0.8, alpha=0.7, label='Max (2000 kWh)')
+ax.axhline(0,         color='gray',  linestyle='--', linewidth=0.8, alpha=0.7, label='Min (0 kWh)')
+ax.axhline(soc_init,  color='black', linestyle=':',  linewidth=0.8, alpha=0.5, label='Initial SOC (1000 kWh)')
+for d in range(0, N_DAYS + 1, 5):
+    ax.axvline(d * 24, color='gray', linewidth=0.3, alpha=0.4)
+tick_h = np.arange(0, N_DAYS * 24 + 1, 7 * 24)
+ax.set_xticks(tick_h)
+ax.set_xticklabels([f'Day {t//24 + 1}' for t in tick_h], fontsize=8)
+ax.set_xlabel('Hour'); ax.set_ylabel('SOC (kWh)')
+ax.set_title(f'Battery State of Charge — 1-Day Strict LP  |  Net Profit: £{total_profit:,.2f}',
+             fontsize=11, fontweight='bold')
+ax.set_ylim(-50, 2150); ax.legend(fontsize=8, loc='upper right'); ax.grid(True, alpha=0.2)
+plt.tight_layout()
+plt.savefig('plot1_strict_soc.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved plot1_strict_soc.png")
+
+# ── Plot 2: Daily profit bar chart ───────────────────────────────
+fig, ax = plt.subplots(figsize=(14, 4))
+bar_colors = [COLOR if p >= 0 else '#EF5350' for p in daily_profit]
+ax.bar(days, daily_profit, color=bar_colors, alpha=0.85, edgecolor='white', linewidth=0.3)
+ax.axhline(0, color='black', linewidth=0.8)
+ax2 = ax.twinx()
+ax2.plot(days, np.cumsum(daily_profit), color='black', linewidth=1.8,
+         label=f'Cumulative profit (£{total_profit:,.0f})')
+ax2.set_ylabel('Cumulative Profit (£)', fontsize=9)
+ax2.legend(loc='upper left', fontsize=8)
+neg_days = sum(1 for p in daily_profit if p < 0)
+ax.text(0.99, 0.97, f'Loss days: {neg_days} / {N_DAYS}',
+        transform=ax.transAxes, ha='right', va='top', fontsize=9, color='#EF5350')
+ax.set_xlabel('Day'); ax.set_ylabel('Daily Profit (£)')
+ax.set_title('Daily Profit — 1-Day Strict LP', fontsize=11, fontweight='bold')
+ax.set_xticks(np.arange(0, N_DAYS + 1, 5))
+ax.grid(True, alpha=0.2, axis='y')
+plt.tight_layout()
+plt.savefig('plot2_strict_daily_profit.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved plot2_strict_daily_profit.png")
+
+# ── Plot 3: Price vs dispatch (first 7 days) ─────────────────────
+fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+fig.suptitle('Price vs Dispatch — 1-Day Strict LP (First 7 Days)', fontsize=12, fontweight='bold')
+hrs7 = np.arange(7 * T_DAY)
+ax1.plot(hrs7, prices_mwh[:7*T_DAY], color='#9C27B0', linewidth=1.2, label='Day-ahead price')
+ax1.axhline(prices_mwh.mean(), color='gray', linestyle='--', linewidth=0.8,
+            label=f'Mean £{prices_mwh.mean():.0f}/MWh')
+ax1.set_ylabel('Price (£/MWh)'); ax1.legend(fontsize=8); ax1.grid(True, alpha=0.2)
+ax2.bar(hrs7, p_ch_series[:7*T_DAY],   color='#2196F3', alpha=0.8, label='Charging (kW)',    width=0.8)
+ax2.bar(hrs7, -p_dis_series[:7*T_DAY], color='#FF5722', alpha=0.8, label='Discharging (kW)', width=0.8)
+ax2.axhline(0, color='black', linewidth=0.5)
+ax2.set_ylabel('Power (kW)'); ax2.legend(fontsize=8); ax2.grid(True, alpha=0.2)
+ax3.fill_between(np.arange(7*T_DAY+1), 0, soc_series[:7*T_DAY+1], alpha=0.4, color=COLOR)
+ax3.plot(np.arange(7*T_DAY+1), soc_series[:7*T_DAY+1], color=COLOR, linewidth=1.2, label='SOC')
+ax3.axhline(capacity, color='red',  linestyle='--', linewidth=0.8, alpha=0.7)
+ax3.axhline(0,        color='gray', linestyle='--', linewidth=0.8, alpha=0.7)
+ax3.set_ylabel('SOC (kWh)'); ax3.set_ylim(-50, 2150); ax3.legend(fontsize=8); ax3.grid(True, alpha=0.2)
+for ax in [ax1, ax2, ax3]:
+    for d in range(8):
+        ax.axvline(d*24, color='gray', linewidth=0.5, alpha=0.5)
+tick_h = np.arange(0, 7*T_DAY+1, 24)
+ax3.set_xticks(tick_h)
+ax3.set_xticklabels([f'Day {i+1}' for i in range(len(tick_h))], fontsize=8)
+ax3.set_xlabel('Hour')
+plt.tight_layout()
+plt.savefig('plot3_strict_dispatch.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved plot3_strict_dispatch.png")
+
+# ── Plot 4: Daily revenue vs cost breakdown ──────────────────────
+fig, ax = plt.subplots(figsize=(14, 4))
+ax.bar(days, daily_revenue, label='Revenue (discharge)', color='#4CAF50', alpha=0.85, edgecolor='white', linewidth=0.3)
+ax.bar(days, -daily_cost,   label='Cost (charge)',       color='#F44336', alpha=0.85, edgecolor='white', linewidth=0.3)
+ax.axhline(0, color='black', linewidth=0.8)
+ax.set_xlabel('Day'); ax.set_ylabel('£')
+ax.set_title('Daily Revenue vs Cost — 1-Day Strict LP', fontsize=11, fontweight='bold')
+ax.legend(fontsize=9); ax.grid(True, alpha=0.2, axis='y')
+ax.set_xticks(np.arange(0, N_DAYS + 1, 5))
+plt.tight_layout()
+plt.savefig('plot4_strict_revenue_cost.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("Saved plot4_strict_revenue_cost.png")
